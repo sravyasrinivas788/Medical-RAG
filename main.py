@@ -2,18 +2,20 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from database import setup_tables, seed_dummy_data, save_file, get_all_files
 from ingest import ingest_all, ingest_pdfs, setup_qdrant
-from query import ask
+from query import ask,build_bm25_index
 
 app = FastAPI(title="Medical Knowledge Base")
 
 ALLOWED_TYPES = {"pdf", "txt"}
 
-# @app.on_event("startup")
-# def startup():
-#     setup_tables()
-#     seed_dummy_data()
-#     setup_qdrant()
-#     ingest_all()  
+@app.on_event("startup")
+def startup():
+    # setup_tables()
+    # seed_dummy_data()
+    # setup_qdrant()
+    # ingest_all()  
+    build_bm25_index()
+
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -26,6 +28,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     
     ingest_pdfs()
+    build_bm25_index()
 
     return {
         "status": "uploaded and ingested",
