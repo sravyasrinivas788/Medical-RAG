@@ -52,6 +52,20 @@ def setup_tables():
             notes       TEXT
         );
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS conversations (
+            id         SERIAL PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role       TEXT NOT NULL,      -- 'user' or 'assistant'
+            content    TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_conversations_session
+        ON conversations (session_id, created_at);
+    """)
+
 
     conn.commit()
     cur.close()
@@ -198,3 +212,37 @@ def get_all_lab_ranges():
     cur.close()
     conn.close()
     return rows
+
+
+def save_message(session_id: str, role: str, content: str):
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute(
+        "INSERT INTO conversations (session_id, role, content) VALUES (%s,%s,%s)",
+        (session_id, role, content)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_history(session_id: str, last_n: int = 6) -> list[dict]:
+    conn = get_conn()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("""
+        SELECT role, content, created_at FROM conversations
+        WHERE session_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s
+    """, (session_id, last_n))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"role": r["role"], "content": r["content"], "created_at": r["created_at"]} for r in reversed(rows)]
+
+def clear_history(session_id: str):
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("DELETE FROM conversations WHERE session_id = %s", (session_id,))
+    conn.commit()
+    cur.close()
+    conn.close()

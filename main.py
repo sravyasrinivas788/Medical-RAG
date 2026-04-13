@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from database import setup_tables, seed_dummy_data, save_file, get_all_files
+from database import setup_tables, seed_dummy_data, save_file, get_all_files,clear_history
 from ingest import ingest_all, ingest_pdfs, setup_qdrant
 from query import ask,build_bm25_index
 
@@ -38,13 +38,22 @@ async def upload_file(file: UploadFile = File(...)):
 
 class QueryRequest(BaseModel):
     query: str
+    session_id: str = "default"
 
 @app.post("/ask")
 async def ask_question(req: QueryRequest):
     if not req.query.strip():
         raise HTTPException(400, "Query cannot be empty.")
-    return ask(req.query)
+    session_id=req.session_id
+    result=ask(req.query, session_id)
+    return result
 
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    from database import get_history
+    history = get_history(session_id, last_n=20)
+    return {"session_id": session_id, "history": history}
+    
 @app.get("/documents")
 async def list_documents():
     files = get_all_files()
