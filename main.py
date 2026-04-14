@@ -3,8 +3,11 @@ from pydantic import BaseModel
 from database import setup_tables, seed_dummy_data, save_file, get_all_files,clear_history
 from ingest import ingest_all, ingest_pdfs, setup_qdrant
 from query import ask,build_bm25_index
+from agent import run_agent
+from mcp_server import mcp_app
 
 app = FastAPI(title="Medical Knowledge Base")
+app.mount("/mcp", mcp_app)
 
 ALLOWED_TYPES = {"pdf", "txt"}
 
@@ -61,6 +64,16 @@ async def list_documents():
         {"id": f["id"], "name": f["name"], "type": f["file_type"]}
         for f in files
     ]
+
+
+@app.post("/agent/ask")
+async def agent_ask(req: QueryRequest):
+    if not req.query.strip():
+        raise HTTPException(400, "Query cannot be empty.")
+    session_id=req.session_id
+    result=run_agent(req.query, session_id)
+    return result
+    
 
 @app.get("/health")
 async def health():
