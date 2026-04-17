@@ -11,7 +11,10 @@ load_dotenv()
 
 embedder    = SentenceTransformer("BAAI/bge-base-en-v1.5")
 reranker    = CrossEncoder("BAAI/bge-reranker-base")
-qdrant      = QdrantClient(host="localhost", port=6333)
+qdrant = QdrantClient(
+    host=os.getenv("QDRANT_HOST", "localhost"),
+    port=int(os.getenv("QDRANT_PORT", 6333))
+)
 groq_client = Groq(api_key=os.getenv("GROQ_API"))
 COLLECTION  = "medical_knowledge"
 

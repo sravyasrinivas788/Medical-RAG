@@ -6,7 +6,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def get_conn():
-    return psycopg2.connect(os.getenv("POSTGRES_URL"))
+    url = os.getenv("POSTGRES_URL")
+    if url:
+        return psycopg2.connect(url)
+   
+    return psycopg2.connect(
+        host=os.getenv("POSTGRES_HOST"),
+        port=os.getenv("POSTGRES_PORT"),
+        database=os.getenv("POSTGRES_DB"),
+        user=os.getenv("POSTGRES_USER"),
+        password=os.getenv("POSTGRES_PASSWORD")
+    )
 
 def setup_tables():
     conn = get_conn()

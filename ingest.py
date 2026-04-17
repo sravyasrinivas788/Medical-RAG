@@ -2,13 +2,17 @@ import fitz
 import uuid
 import re
 import io
+import os
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
 from database import get_all_drugs, get_all_lab_ranges, get_all_files, get_all_policies
 import pdfplumber
 embedder = SentenceTransformer('BAAI/bge-base-en-v1.5')
-qdrant = QdrantClient(url="http://localhost:6333")
+qdrant = QdrantClient(
+    host=os.getenv("QDRANT_HOST", "localhost"),
+    port=int(os.getenv("QDRANT_PORT", 6333))
+)
 COLLECTION_NAME = "medical_knowledge"
 
 
