@@ -3,24 +3,32 @@ import uuid
 import re
 import io
 import os
-from sentence_transformers import SentenceTransformer
-from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct, Filter, FieldCondition, MatchValue
 from database import get_all_drugs, get_all_lab_ranges, get_all_files, get_all_policies
 import pdfplumber
-embedder = SentenceTransformer('BAAI/bge-base-en-v1.5')
-qdrant = QdrantClient(
-    host=os.getenv("QDRANT_HOST", "localhost"),
-    port=int(os.getenv("QDRANT_PORT", 6333))
-)
+from qdrant_client import QdrantClient
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Qdrant
+from langchain_core.documents import Document
+
 COLLECTION_NAME = "medical_knowledge"
 
 
+embedding_model=HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+
+qdrant_client = QdrantClient(url="http://localhost:6333")
+
+qdrant_store=Qdrant(
+    client=qdrant_client,
+    collection_name=COLLECTION_NAME,
+    embeddings=embedding_model
+)
+
 
 def setup_qdrant():
-    existing = [c.name for c in qdrant.get_collections().collections]
+    existing = [c.name for c in qdrant_client.get_collections().collections]
     if COLLECTION_NAME not in existing:
-        qdrant.create_collection(
+        qdrant_client.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config=VectorParams(size=768, distance=Distance.COSINE)
         )
@@ -151,25 +159,22 @@ def ingest_pdfs():
         if not all_chunks:
             print(f"No text extracted from {name}, skipping.")
             continue
-        texts=[c["text"] for c in all_chunks]
-
-        embeddings = embedder.encode(texts, show_progress_bar=True)
-        points = [
-            PointStruct(
-                id=str(uuid.uuid4()),
-                vector=emb.tolist(),
-                payload={
-                    "text": chunk["text"],
+        docs=[
+            Document(
+                page_content=chunk["text"],
+                metadata={
                     "source": name,
                     "source_type": "pdf",
                     "heading": chunk["heading"],
-                    "doc_id": f["id"]
+                    "page": chunk["page"]
                 }
-            )
-            for chunk, emb in zip(all_chunks, embeddings)
+            ) for chunk in all_chunks
+
+
+
+
         ]
-        qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"Ingested {len(points)} chunks from PDF: {name}")
+        qdrant_store.add_documents(docs)
 
 
 
@@ -179,22 +184,21 @@ def ingest_policies():
         print("No policies found.")
         return
 
-    points = []
+    docs = []
     for p in policies:
         text = f"Clinic policy — {p['topic']}: {p['description']}"
-        embedding = embedder.encode(text).tolist()
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "text": text,
-                "source": f"Clinic policy: {p['topic']}",
-                "source_type": "db_policy",
-                "policy_id": p["id"]
-            }
-        ))
+        docs.append(
+    Document(
+        page_content=text,
+        metadata={
+            "source": f"Drug record: {d['name']}",
+            "source_type": "db_drug",
+            "drug_id": d["id"]
+        }
+    )
+)
 
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    qdrant_store.add_documents(docs)
     print(f"Ingested {len(points)} clinic policies.") 
 
 
@@ -205,7 +209,7 @@ def ingest_drugs():
         print("No drugs found.")
         return
 
-    points = []
+    docs = []
     for d in drugs:
         text = (
             f"Drug: {d['name']}. "
@@ -215,20 +219,19 @@ def ingest_drugs():
             f"Contraindications: {d['contraindications']}. "
             f"Side effects: {d['side_effects']}."
         )
-        embedding = embedder.encode(text).tolist()
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "text": text,
-                "source": f"Drug record: {d['name']}",
-                "source_type": "db_drug",
-                "drug_id": d["id"]
-            }
-        ))
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": f"Drug record: {d['name']}",
+                    "source_type": "db_drug",
+                    "drug_id": d["id"]
+                }
+            )
+        )
 
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-    print(f"Ingested {len(points)} drug records.")
+    qdrant_store.add_documents(docs)
+    print(f"Ingested {len(docs)} drug records.")
 
 
 
@@ -238,27 +241,27 @@ def ingest_lab_ranges():
         print("No lab ranges found.")
         return
 
-    points = []
+    docs = []
     for l in labs:
         text = (
             f"Lab test: {l['test_name']}. "
             f"Normal range: {l['normal_range']} {l['unit']}. "
             f"Clinical notes: {l['notes']}."
         )
-        embedding = embedder.encode(text).tolist()
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "text": text,
-                "source": f"Lab reference: {l['test_name']}",
-                "source_type": "db_lab",
-                "lab_id": l["id"]
-            }
-        ))
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "source": f"Lab reference: {l['test_name']}",
+                    "source_type": "db_lab",
+                    "lab_id": l["id"]
+                }
+            )
+        )
+        
 
-    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-    print(f"Ingested {len(points)} lab reference ranges.")
+    qdrant_store.add_documents(docs)
+    print(f"Ingested {len(docs)} lab reference ranges.")
 
 
 

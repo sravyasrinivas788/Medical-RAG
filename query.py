@@ -4,8 +4,17 @@ from groq import Groq
 import os
 from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
-from database import save_message, get_history
+from database import get_history,save_message
 from datetime import datetime, timedelta
+
+
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+from langchain_core.language_models import LLM
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda
+
 
 load_dotenv()
 
@@ -42,12 +51,13 @@ def build_bm25_index():
 
     bm25_corpus = [
         {
-            "text":        p.payload["text"],
-            "source":      p.payload["source"],
-            "source_type": p.payload["source_type"],
+            "text":        p.payload.get("page_content") or p.payload.get("text", ""),
+            "source":      p.payload.get("source", ""),
+            "source_type": p.payload.get("source_type", ""),
             "heading":     p.payload.get("heading", "")
         }
         for p in all_points
+        if p.payload.get("page_content") or p.payload.get("text")
     ]
 
     tokenized  = [doc["text"].lower().split() for doc in bm25_corpus]
@@ -64,9 +74,9 @@ def dense_search(query: str, top_k: int = 10) -> list[dict]:
     ).points
     return [
         {
-            "text":        r.payload["text"],
-            "source":      r.payload["source"],
-            "source_type": r.payload["source_type"],
+            "text":        r.payload.get("page_content") or r.payload.get("text", ""),
+            "source":      r.payload.get("source", ""),
+            "source_type": r.payload.get("source_type", ""),
             "score":       round(r.score, 3),
             "heading":     r.payload.get("heading", "")
         }
@@ -169,143 +179,144 @@ def search(query: str) -> list[dict]:
     final  = rerank(query, merged[:10], top_n=5)
     return final
 
-def rewrite_query_history(query: str, history: list[dict]) -> str:
+class HybridRetriever(BaseRetriever):
+    def _get_relevant_documents(self, query: str) -> list[Document]:
+        chunks=search(query)
+        docs=[]
+        for c in chunks:
+            docs.append(
+                Document(
+                    page_content=c["text"],
+                    metadata={"source": c["source"], "source_type": c.get("source_type", ""), "heading": c.get("heading", "")}
+                )
+            )
+        return docs
+
+
+class GroqLLM(LLM):
+    def _call(self, prompt: str, stop=None):
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
+        return response.choices[0].message.content
+
+    @property
+    def _llm_type(self):
+        return "groq"
+
+
+
+
+PROMPT=PromptTemplate(
+    template="""You are a medical expert assistant. Use the following context to answer the question.
+If you don't know the answer, just say "I don't know". Don't make up an answer.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:""",
+    input_variables=["context", "question"]
+)
+REWRITE_PROMPT=PromptTemplate(
+    template="""Rewrite the following question to be more specific and detailed based on the conversation history.
+
+Conversation History:
+{history}
+
+Current Question: {question}
+
+Rewritten Question:""",
+    input_variables=["history", "question"]
+)
+
+reteriver=HybridRetriever()
+llm=GroqLLM()
+
+def format_docs(docs):
+    return "\n\n".join(
+        f"[Source: {d.metadata['source']}]\n{d.page_content}"
+        for d in docs
+    )
+
+
+
+def rewrite_query(query:str,history):
     if not history:
         return query
 
-    history_text = "\n".join(
+    history_text="\n".join(
         f"{h['role'].upper()}: {h['content']}"
-        for h in history[-10:]
+        for h in history[-6:]
     )
-
-    prompt = f"""Given this conversation history and a follow-up question,
-rewrite the follow-up question to be self-contained and clear.
-If the follow-up already makes sense standalone, return it unchanged.
-Do NOT add speculation or extra context that wasn't in the original question.
-Preserve the exact terms and spelling from the original question.
-Return ONLY the rewritten question, nothing else.
-
-Conversation history:
-{history_text}
-
-Follow-up question: {query}
-Rewritten question:"""
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=100
-    )
-    return response.choices[0].message.content.strip()
-
-def ask(query: str, session_id: str) -> dict:
-    # get history and check if it's recent (within 8 hours)
-    raw_history = get_history(session_id)
+    prompt=REWRITE_PROMPT.format(history=history_text,question=query)
+    return llm.invoke(prompt)
     
-    # Filter history by time - only use if last message is within 8 hours
-    history = []
-    if raw_history:
-        last_message_time = raw_history[-1].get("created_at")
-        if last_message_time:
-            # Handle both timezone-aware and naive datetimes
-            now = datetime.now(last_message_time.tzinfo) if last_message_time.tzinfo else datetime.now()
-            time_diff = now - last_message_time
-            
-            # Only use history if last message is within 8 hours
-            if time_diff <= timedelta(hours=8):
-                history = raw_history
-                print(f"Using conversation history (last message: {time_diff.total_seconds()/3600:.1f} hours ago)")
-            else:
-                print(f"Ignoring old conversation history (last message: {time_diff.total_seconds()/3600:.1f} hours ago)")
     
-    # Only rewrite if there are at least 2 previous exchanges (4+ messages)
-    if len(history) >= 4:
-        rewritten_query = rewrite_query_history(query, history)
-        if rewritten_query != query:
-            print(f"Query rewritten: '{query}' → '{rewritten_query}'")
-    else:
-        rewritten_query = query
+def rewrite_steps(inputs):
+    query=inputs["query"]
+    session_id=inputs["session_id"]
+    history=get_history(session_id)
+    rewritten_query=rewrite_query(query,history)
+    return{"query": rewritten_query, "session_id": session_id}
 
-    # search with rewritten query
-    chunks = search(rewritten_query)
 
-    if not chunks:
-        answer = "I don't have enough information to answer this."
-        save_message(session_id, "user",      query)
-        save_message(session_id, "assistant", answer)
-        return {
-            "answer":           answer,
-            "sources":          [],
-            "confidence":       "low",
-            "session_id":       session_id,
-            "rewritten_query":  rewritten_query if rewritten_query != query else None
-        }
 
-    top_score  = chunks[0]["rerank_score"]
-    confidence = get_confidence_level(top_score)
+def retrive_step(inputs):
+    query=inputs["query"]
+    session_id=inputs["session_id"]
+    docs=reteriver.invoke(query)
+    context=format_docs(docs)
+    return{"docs": docs, "session_id": session_id,"context":context,"history":inputs.get("history",[]),"query":query}
 
-    # Use all chunks returned by rerank
-    strong_chunks = chunks
+def save_memory(inputs,answer):
+    save_message(inputs["session_id"], "user", inputs["query"])
+    save_message(inputs["session_id"], "assistant", answer)
     
-    context = "\n\n".join(
-        f"[{i+1}] Source: {c['source']} (type: {c['source_type']}) | relevance: {c['rerank_score']}\n{c['text']}"
-        for i, c in enumerate(strong_chunks)
-    )
 
-    print(f"\n=== DEBUG: Context being sent to LLM ===")
-    print(f"Query: {query}")
-    print(f"Confidence: {confidence} (top score: {top_score})")
-    print(f"Context:\n{context}\n")
 
-    system_msg = """You are a medical knowledge assistant for a clinic.
-Answer questions using only the context provided.
-If the answer is not in the context, say exactly: "I don't have enough information to answer this."
-Do not speculate. Do not explain symbols or codes you don't understand.
-Always mention which source(s) you used at the end of your answer.
-Format answers clearly with numbered points where applicable."""
 
-    messages = [{"role": "system", "content": system_msg}]
+chain=(
+    RunnableLambda(rewrite_steps) |
+    RunnableLambda(retrive_step) |
+    {
+        "context": RunnableLambda(lambda x: x["context"]),
+        "question": RunnableLambda(lambda x: x["query"])
+    }
+    | PROMPT
+    | llm
+    | StrOutputParser()
+)
 
-    for h in history[-10:]:
-        cleaned_content = clean_history_message(h["content"])
-        messages.append({"role": h["role"], "content": cleaned_content})
-
-    
-    user_content = f"Context:\n{context}\n\nQuestion: {query}"
-    if confidence == "medium":
-        user_content += "\n\nNote: Available information is limited. Prefix your answer with 'Based on limited available information:'"
-    
-    # Add note if query was rewritten to help LLM understand context
-    if rewritten_query != query:
-        user_content += f"\n\n(Note: The user's question may contain typos or informal terms. Interpret the question based on the context provided.)"
-
-    messages.append({"role": "user", "content": user_content})
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        temperature=0.2
-    )
-
-    answer = response.choices[0].message.content
-
-    save_message(session_id, "user",      query)
-    save_message(session_id, "assistant", answer)
-
-    return {
-        "answer":          answer,
-        "confidence":      confidence,
-        "session_id":      session_id,
-        "rewritten_query": rewritten_query if rewritten_query != query else None,
+def ask(query: str, session_id:str):
+    answer=chain.invoke({"query": query, "session_id": session_id})
+    save_memory({"session_id": session_id, "query": query}, answer)
+    docs=reteriver.invoke(query)
+    return{
+        "answer": answer,
         "sources": [
             {
-                "source":       c["source"],
-                "source_type":  c["source_type"],
-                "rerank_score": c.get("rerank_score", 0),
-                "section":      c.get("heading", ""),
-                "page":         c.get("page", "")
+                "source":      d.metadata.get("source", ""),
+                "source_type": d.metadata.get("source_type", ""),
+                "heading":     d.metadata.get("heading", "")
             }
-            for c in strong_chunks
+            for d in docs
         ]
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+

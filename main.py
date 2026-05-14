@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from database import setup_tables, seed_dummy_data, save_file, get_all_files,clear_history
@@ -6,18 +7,22 @@ from query import ask,build_bm25_index
 from agent import run_agent
 from mcp_server import mcp_app
 from multi_agent import run_multi_agent
-app = FastAPI(title="Medical Knowledge Base")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # setup_tables()
+    # seed_dummy_data()
+    # setup_qdrant()
+    # ingest_all()
+    build_bm25_index()
+    yield
+
+app = FastAPI(title="Medical Knowledge Base", lifespan=lifespan)
+# app = FastAPI(title="Medical Knowledge Base")
+
 app.mount("/mcp", mcp_app)
 
 ALLOWED_TYPES = {"pdf", "txt"}
-
-@app.on_event("startup")
-def startup():
-    setup_tables()
-    seed_dummy_data()
-    setup_qdrant()
-    ingest_all()  
-    build_bm25_index()
 
 
 @app.post("/upload")
