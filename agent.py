@@ -5,7 +5,8 @@ from psycopg2.extras import RealDictCursor
 import os
 import json
 from dotenv import load_dotenv
-
+from typing import TypedDict,List,Dict,Any
+from langgraph.graph import StateGraph, END
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API"))
@@ -85,15 +86,18 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
 
         results = search(query)
         if not results:
-            return "No relevant results found for this query."
+            return "No relevant results found for this query.", []
 
-        # format results for the agent to read
         formatted = "\n\n".join(
             f"Result {i+1} (score: {r.get('rerank_score', 0)}, "
             f"source: {r['source']}, section: {r.get('heading', 'N/A')}):\n{r['text']}"
             for i, r in enumerate(results)
         )
-        return formatted
+        sources = [
+            {"source": r.get("source",""), "source_type": r.get("source_type",""), "heading": r.get("heading","")}
+            for r in results
+        ]
+        return formatted, sources
 
     elif tool_name == "get_drug_record":
         drug_name = tool_args["drug_name"]
@@ -110,7 +114,7 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
         conn.close()
 
         if not drug:
-            return f"No drug record found for '{drug_name}'."
+            return f"No drug record found for '{drug_name}'.", []
 
         return (
             f"Drug: {drug['name']}\n"
@@ -119,7 +123,7 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
             f"Dosage: {drug['dosage']}\n"
             f"Contraindications: {drug['contraindications']}\n"
             f"Side effects: {drug['side_effects']}"
-        )
+        ), [{"source": f"db:drugs:{drug['name']}", "source_type": "db_drug", "heading": ""}]
 
     elif tool_name == "get_lab_range":
         test_name = tool_args["test_name"]
@@ -136,26 +140,30 @@ def execute_tool(tool_name: str, tool_args: dict) -> str:
         conn.close()
 
         if not lab:
-            return f"No lab range found for '{test_name}'."
+            return f"No lab range found for '{test_name}'.", []
 
         return (
             f"Test: {lab['test_name']}\n"
             f"Normal range: {lab['normal_range']} {lab['unit']}\n"
             f"Notes: {lab['notes']}"
-        )
+        ), [{"source": f"db:lab_ranges:{lab['test_name']}", "source_type": "db_lab", "heading": ""}]
 
-    return f"Unknown tool: {tool_name}"
+    return f"Unknown tool: {tool_name}", []
+
+class AgentState(TypedDict):
+    query: str
+    session_id: str
+    messages: List[Dict[str, Any]]
+    tool_calls: List[Dict[str, Any]]
+    iteration: int
+    last_message: Any
+    sources: List[Dict[str, Any]]
+    answer: str
 
 
-def run_agent(query: str, session_id: str) -> dict:
-    history  = get_history(session_id)
-    iteration = 0
-    tool_calls_made = []
-
-    print(f"\n=== Agent starting for query: '{query}' ===")
-
-    # build initial messages
-    system_msg = """You are a medical knowledge assistant for a clinic.
+def init_state(query:str,session_id:str):
+    history=get_history(session_id)
+    system_msg="""You are a medical knowledge assistant for a clinic.
 You have access to tools to search a medical knowledge base.
 
 CRITICAL RULES:
@@ -166,113 +174,105 @@ CRITICAL RULES:
 - If your first search doesn't give enough information, search again with a different query.
 - Once you have sufficient information from the tools, provide a clear and cited answer.
 - Always mention which sources you used."""
-
-    messages = [{"role": "system", "content": system_msg}]
-
-    # add conversation history
+    messages=[{"role":"system","content":system_msg}]
     for h in history[-6:]:
-        messages.append({"role": h["role"], "content": h["content"]})
+        messages.append({"role":h["role"],"content":h["content"]})
+    messages.append({"role":"user","content":query})
+    return{
+        "query":query,
+        "session_id":session_id,
+        "messages":messages,
+        "tool_calls":[],
+        "iteration":0,
+        "last_message":None,
+        "sources":[],
+        "answer":""
+    }
 
-    # add current query
-    messages.append({"role": "user", "content": query})
+def llm_node(state:AgentState):
+    state["iteration"] += 1
+    response=groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=state["messages"],
+        tools=TOOLS,
+        tool_choice="auto"
+    )
+    answer=response.choices[0].message
+    state["last_message"]=answer
+    state["messages"].append({
+        "role":"assistant",
+        "content":answer.content,
+        "tool_calls":answer.tool_calls if answer.tool_calls else None
+    })
+    return state
 
-    while iteration < MAX_ITERATIONS:
-        iteration += 1
-        print(f"\n--- Iteration {iteration} ---")
+def tool_node(state:AgentState):
+    answer=state["last_message"]
+    if answer.tool_calls:
+        for tool_call in answer.tool_calls:
+            tool_name=tool_call.function.name
+            tool_args=json.loads(tool_call.function.arguments)
+            result, sources=execute_tool(tool_name,tool_args)
 
-        # Force tool use on first iteration to ensure agent searches before answering
-        # tool_choice_setting = "required" if iteration == 1 else "auto"
-        
-        try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.2
-            )
-        except Exception as e:
-            print(f"Error calling Groq API: {e}")
-            answer = "I encountered an error while processing your request. Please try again."
-            save_message(session_id, "user", query)
-            save_message(session_id, "assistant", answer)
-            return {
-                "answer": answer,
-                "session_id": session_id,
-                "iterations": iteration,
-                "tools_used": tool_calls_made,
-                "agent_mode": True,
-                "error": str(e)
-            }
-
-        msg = response.choices[0].message
-
-        # check if agent wants to call tools
-        if msg.tool_calls:
-            # add agent's tool call decision to messages
-            messages.append({
-                "role":       "assistant",
-                "content":    msg.content or "",
-                "tool_calls": [
-                    {
-                        "id":       tc.id,
-                        "type":     "function",
-                        "function": {
-                            "name":      tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    }
-                    for tc in msg.tool_calls
-                ]
+            state["tool_calls"].append({
+                "tool_name":tool_name,
+                "tool_args":tool_args,
+                "result":result
             })
 
-            # execute each tool call
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                tool_args = json.loads(tc.function.arguments)
+            for src in sources:
+                if src not in state["sources"]:
+                    state["sources"].append(src)
 
-                result = execute_tool(tool_name, tool_args)
+            state["messages"].append({
+                "role":"tool",
+                "content":result,
+                "tool_call_id":tool_call.id
+            })
+    return state
 
-                tool_calls_made.append({
-                    "tool":   tool_name,
-                    "args":   tool_args,
-                    "result": result[:200]  # truncate for response
-                })
+def should_continue(state:AgentState):
+    msg=state["last_message"]
+    if not msg.tool_calls or state["iteration"] >= MAX_ITERATIONS:
+        return "end"
+    else:
+        return "tool_node"
 
-                # add tool result back to messages
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      result
-                })
+def final_node(state:AgentState):
+    msg=state["last_message"]
+    answer=msg.content or "No response"
+    save_message(state["session_id"],"user",state["query"])
+    save_message(state["session_id"],"assistant",answer)
+    state["answer"]=answer
+    return state
 
-        else:
-            # no tool calls — agent has produced final answer
-            print(f"Agent finished in {iteration} iterations")
-            answer = msg.content
+    
+           
+builder=StateGraph(AgentState)
 
-            # save to history
-            save_message(session_id, "user",      query)
-            save_message(session_id, "assistant", answer)
+builder.add_node("llm",llm_node)
+builder.add_node("tools",tool_node)
+builder.add_node("final",final_node)
 
-            return {
-                "answer":      answer,
-                "session_id":  session_id,
-                "iterations":  iteration,
-                "tools_used":  tool_calls_made,
-                "agent_mode":  True
-            }
+builder.set_entry_point("llm")
+builder.add_conditional_edges(
+    "llm",
+    should_continue,
+    {
+        "tool_node":"tools",
+        "end":"final"
+    }
+)
+builder.add_edge("tools","llm")
+builder.add_edge("final",END)
+graph=builder.compile()
 
-    # max iterations reached — return what we have
-    print(f"Max iterations ({MAX_ITERATIONS}) reached")
-    answer = "I was unable to find sufficient information to answer this question confidently."
-    save_message(session_id, "user",      query)
-    save_message(session_id, "assistant", answer)
-
+def run_agent(query:str,session_id: str):
+    state=init_state(query,session_id)
+    result=graph.invoke(state)
     return {
-        "answer":     answer,
-        "session_id": session_id,
-        "iterations": iteration,
-        "tools_used": tool_calls_made,
-        "agent_mode": True
+        "answer":     result.get("answer","No response"),
+        "tools_used": [tc["tool_name"] for tc in result.get("tool_calls",[])],
+        "sources":    result.get("sources",[]),
+        "session_id": result.get("session_id",session_id)
     }

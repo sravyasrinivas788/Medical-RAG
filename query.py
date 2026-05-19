@@ -14,14 +14,15 @@ from langchain_core.language_models import LLM
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda
-
-
+from langchain_core.output_parsers import PydanticOutputParser
+from pydantic import BaseModel,Field
+ 
 load_dotenv()
 
 embedder    = SentenceTransformer("BAAI/bge-base-en-v1.5")
 reranker    = CrossEncoder("BAAI/bge-reranker-base")
 qdrant = QdrantClient(
-    host=os.getenv("QDRANT_HOST", "localhost"),
+    host=os.getenv("QDRANT_HOST", "localhost"),  
     port=int(os.getenv("QDRANT_PORT", 6333))
 )
 groq_client = Groq(api_key=os.getenv("GROQ_API"))
@@ -52,9 +53,9 @@ def build_bm25_index():
     bm25_corpus = [
         {
             "text":        p.payload.get("page_content") or p.payload.get("text", ""),
-            "source":      p.payload.get("source", ""),
-            "source_type": p.payload.get("source_type", ""),
-            "heading":     p.payload.get("heading", "")
+            "source":      p.payload.get("metadata", {}).get("source", ""),
+            "source_type": p.payload.get("metadata", {}).get("source_type", ""),
+            "heading":     p.payload.get("metadata", {}).get("heading", "")
         }
         for p in all_points
         if p.payload.get("page_content") or p.payload.get("text")
@@ -75,10 +76,10 @@ def dense_search(query: str, top_k: int = 10) -> list[dict]:
     return [
         {
             "text":        r.payload.get("page_content") or r.payload.get("text", ""),
-            "source":      r.payload.get("source", ""),
-            "source_type": r.payload.get("source_type", ""),
+            "source":      r.payload.get("metadata", {}).get("source", ""),
+            "source_type": r.payload.get("metadata", {}).get("source_type", ""),
             "score":       round(r.score, 3),
-            "heading":     r.payload.get("heading", "")
+            "heading":     r.payload.get("metadata", {}).get("heading", "")
         }
         for r in results
     ]
@@ -179,6 +180,12 @@ def search(query: str) -> list[dict]:
     final  = rerank(query, merged[:10], top_n=5)
     return final
 
+
+class MedicalResponse(BaseModel):
+    answer: str = Field(description="Answer to the medical question")
+
+parser = PydanticOutputParser(pydantic_object=MedicalResponse)
+
 class HybridRetriever(BaseRetriever):
     def _get_relevant_documents(self, query: str) -> list[Document]:
         chunks=search(query)
@@ -218,8 +225,11 @@ Context:
 
 Question: {question}
 
+{format_instructions}
+
 Answer:""",
-    input_variables=["context", "question"]
+    input_variables=["context", "question"],
+    partial_variables={"format_instructions": parser.get_format_instructions()}
 )
 REWRITE_PROMPT=PromptTemplate(
     template="""Rewrite the following question to be more specific and detailed based on the conversation history.
@@ -288,15 +298,15 @@ chain=(
     }
     | PROMPT
     | llm
-    | StrOutputParser()
+    | parser
 )
 
 def ask(query: str, session_id:str):
-    answer=chain.invoke({"query": query, "session_id": session_id})
-    save_memory({"session_id": session_id, "query": query}, answer)
+    result=chain.invoke({"query": query, "session_id": session_id})
+    save_memory({"session_id": session_id, "query": query}, result.answer)
     docs=reteriver.invoke(query)
     return{
-        "answer": answer,
+        "answer": result.answer,
         "sources": [
             {
                 "source":      d.metadata.get("source", ""),

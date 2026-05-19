@@ -188,18 +188,18 @@ def ingest_policies():
     for p in policies:
         text = f"Clinic policy — {p['topic']}: {p['description']}"
         docs.append(
-    Document(
-        page_content=text,
-        metadata={
-            "source": f"Drug record: {d['name']}",
-            "source_type": "db_drug",
-            "drug_id": d["id"]
-        }
-    )
-)
+            Document(
+                page_content=text,
+                metadata={
+                    "source": f"Clinic policy: {p['topic']}",
+                    "source_type": "db_policy",
+                    "policy_id": p["id"]
+                }
+            )
+        )
 
     qdrant_store.add_documents(docs)
-    print(f"Ingested {len(points)} clinic policies.") 
+    print(f"Ingested {len(docs)} clinic policies.")
 
 
 
