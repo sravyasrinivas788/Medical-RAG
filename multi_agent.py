@@ -6,6 +6,8 @@ from psycopg2.extras import RealDictCursor
 import os
 import json
 from dotenv import load_dotenv
+from typing import TypedDict,Optional,Dict,Any
+from langgraph.graph import StateGraph,END
 
 load_dotenv()
 
@@ -42,69 +44,9 @@ Direct patients to consult a doctor for clinical interpretation."""
 }
 
 
-def triage(query: str) -> str:
-    agent_descriptions = "\n".join(
-        f"- {key}: {info['description']}"
-        for key, info in AGENTS.items()
-    )
-
-    prompt = f"""You are a medical query triage system.
-Route the following query to the most appropriate specialist agent.
-
-Available agents:
-{agent_descriptions}
-
-Query: {query}
-
-Reply with ONLY one word — the agent key: clinical, drug, or admin.
-If the query needs both clinical and drug knowledge, reply: drug
-If unsure, reply: clinical"""
-
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=10
-    )
-
-    route = response.choices[0].message.content.strip().lower()
-    if route not in AGENTS:
-        route = "clinical"  # safe fallback
-
-    print(f"[Triage] Query routed to: {route}")
-    return route
-
-
-def run_clinical_agent(query: str, session_id: str) -> dict:
-    print("[Clinical Agent] Running...")
-    try:
-        # Use run_agent for iterative tool calling (same as /agent/ask endpoint)
-        result = run_agent(query, session_id=f"{session_id}-clinical")
-        
-        # Determine confidence based on whether tools found useful information
-        confidence = "high" if result.get("tools_used") else "medium"
-        
-        return {
-            "agent":      "clinical",
-            "answer":     result["answer"],
-            "confidence": confidence,
-            "sources":    result.get("tools_used", [])
-        }
-    except Exception as e:
-        print(f"[Clinical Agent] Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return {
-            "agent":      "clinical",
-            "answer":     f"I encountered an error while processing your request: {str(e)}",
-            "confidence": "low",
-            "sources":    []
-        }
-
 def run_drug_agent(query: str, session_id: str) -> dict:
     print("[Drug Agent] Running...")
 
-    # extract drug name from query and do direct DB lookup first
     conn = get_conn()
     cur  = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT name FROM drugs")
@@ -112,19 +54,16 @@ def run_drug_agent(query: str, session_id: str) -> dict:
     cur.close()
     conn.close()
 
-    # find which drug is mentioned
     query_lower  = query.lower()
     matched_drug = next((d for d in all_drugs if d in query_lower), None)
 
     context_parts = []
 
     if matched_drug:
-        # get exact DB record
         drug_result = execute_tool("get_drug_record", {"drug_name": matched_drug})
         context_parts.append(f"Drug record:\n{drug_result}")
         print(f"[Drug Agent] Found drug record: {matched_drug}")
 
-    # also search for additional context
     search_results = search(query)
     if search_results:
         search_context = "\n\n".join(
@@ -173,21 +112,21 @@ def run_admin_agent(query: str, session_id: str) -> dict:
 
     query_lower = query.lower()
 
-    # check if lab test mentioned
+    
     matched_lab = next((l for l in lab_names if l in query_lower), None)
     if matched_lab:
         lab_result = execute_tool("get_lab_range", {"test_name": matched_lab})
         context_parts.append(f"Lab range:\n{lab_result}")
         print(f"[Admin Agent] Found lab range: {matched_lab}")
 
-    # check if policy topic mentioned
+    
     matched_policy = next((p for p in policy_topics if p in query_lower), None)
     if matched_policy:
         policy_result = execute_tool("get_clinic_policy", {"topic": matched_policy})
         context_parts.append(f"Policy:\n{policy_result}")
         print(f"[Admin Agent] Found policy: {matched_policy}")
 
-    # fallback to search
+    
     if not context_parts:
         search_results = search(query)
         if search_results:
@@ -228,68 +167,170 @@ def needs_escalation(result: dict) -> bool:
     answer_lower = result.get("answer", "").lower()
     return any(phrase in answer_lower for phrase in uncertainty_phrases)
 
-def escalate(query: str, result: dict, session_id: str) -> dict:
-    print(f"[Escalation] Low confidence — flagging for human review")
-
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS escalations (
-            id          SERIAL PRIMARY KEY,
-            session_id  TEXT,
-            query       TEXT,
-            agent       TEXT,
-            answer      TEXT,
-            created_at  TIMESTAMP DEFAULT NOW(),
-            resolved    BOOLEAN DEFAULT FALSE
-        )
-    """)
-    cur.execute("""
-        INSERT INTO escalations (session_id, query, agent, answer)
-        VALUES (%s, %s, %s, %s)
-    """, (session_id, query, result.get("agent"), result.get("answer")))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return {
-        **result,
-        "escalated": True,
-        "escalation_message": "This query has been flagged for review by a medical professional. You will receive a response shortly."
-    }
 
 
-def run_multi_agent(query: str, session_id: str) -> dict:
-    print(f"\n=== Multi-agent system starting ===")
-    print(f"Query: '{query}'")
 
-    # step 1 — triage
-    route = triage(query)
 
-    # step 2 — run specialist agent
-    if route == "clinical":
-        result = run_clinical_agent(query, session_id)
-    elif route == "drug":
-        result = run_drug_agent(query, session_id)
-    elif route == "admin":
-        result = run_admin_agent(query, session_id)
+
+
+
+
+
+class MultiAgentState(TypedDict):
+    query:str
+    session_id:str
+    route:Optional[str]
+    result: Optional[Dict[str, Any]]
+
+
+def triage(query: str) -> str:
+    agent_descriptions = "\n".join(
+        f"- {key}: {info['description']}"
+        for key, info in AGENTS.items()
+    )
+
+    prompt = f"""You are a medical query triage system.
+Route the following query to the most appropriate specialist agent.
+
+Available agents:
+{agent_descriptions}
+
+Query: {query}
+
+Reply with ONLY one word — the agent key: clinical, drug, or admin.
+If the query needs both clinical and drug knowledge, reply: drug
+If unsure, reply: clinical"""
+
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=10
+    )
+
+    route = response.choices[0].message.content.strip().lower()
+    if route not in AGENTS:
+        route = "clinical"  
+
+    print(f"[Triage] Query routed to: {route}")
+    return route
+
+def triage_node(state:MultiAgentState):
+    query=state["query"]
+    route=triage(query)
+    return {"route": route}
+
+def agent_node(state:MultiAgentState):
+    query=state["query"]
+    session_id=state["session_id"]
+    route=state["route"]
+    if route=="clinical":
+        result=run_agent(query,session_id)
+        result={
+            "agent": "clinical",
+            "answer": result["answer"],
+            "confidence": result.get("confidence", "high"),
+            "sources": result.get("sources", []),
+            "tools_used": result.get("tools_used", [])
+        }
+    elif route=="drug":
+        result=run_drug_agent(query,session_id)
     else:
-        result = run_clinical_agent(query, session_id)
+        result=run_admin_agent(query,session_id)
+    return {"result": result}
 
-    # step 3 — confidence check + escalation
+def escalate_node(state:MultiAgentState):
+    result=state["result"]
     if needs_escalation(result):
-        result = escalate(query, result, session_id)
+        print("[Escalation Triggered]")
 
-    # step 4 — save to conversation history
-    save_message(session_id, "user",      query)
-    save_message(session_id, "assistant", result["answer"])
+        conn = get_conn()
+        cur = conn.cursor()
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS escalations (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT,
+                query TEXT,
+                agent TEXT,
+                answer TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            INSERT INTO escalations (session_id, query, agent, answer)
+            VALUES (%s, %s, %s, %s)
+        """, (
+            state["session_id"],
+            state["query"],
+            result.get("agent"),
+            result.get("answer")
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        result["escalated"] = True
+
+    return {**state, "result": result}
+
+def save_node(state: MultiAgentState):
+    result=state["result"]
+    save_message(state["session_id"],"user",state["query"])
+    save_message(state["session_id"],"assistant",result["answer"])
+    return state
+
+def final_node(state:MultiAgentState):
+    return state
+
+
+builder=StateGraph(MultiAgentState)
+
+builder.add_node("triage",triage_node)
+builder.add_node("agent",agent_node)
+builder.add_node("escalate",escalate_node)
+builder.add_node("save",save_node)
+builder.add_node("final",final_node)
+
+
+
+builder.set_entry_point("triage")
+builder.add_edge("triage","agent")
+builder.add_edge("agent","escalate")
+builder.add_edge("escalate","save")
+builder.add_edge("save","final")
+builder.add_edge("final",END)
+graph=builder.compile()
+
+def run_multi_agent(query,session_id):
+    state = graph.invoke(
+        {
+            "query": query,
+            "session_id": session_id,
+        }
+    )
+    result = state["result"]
     return {
-        "answer":     result["answer"],
-        "agent_used": result["agent"],
-        "confidence": result.get("confidence", "medium"),
-        "escalated":  result.get("escalated", False),
-        "sources":    result.get("sources", []),
-        "session_id": session_id,
-        "escalation_message": result.get("escalation_message")
+        "answer": result["answer"],
+        "confidence": result.get("confidence", "high"),
+        "sources": result.get("sources", []),
+        "tools_used": result.get("tools_used", []),
+        "session_id": state["session_id"],
+        "escalated": result.get("escalated", False)
     }
+     
+
+
+
+
+
+
+
+
+
+
+    
+
+
